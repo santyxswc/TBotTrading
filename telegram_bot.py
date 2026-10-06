@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import Bot as engine
@@ -29,6 +30,8 @@ COLORS = {"IWDA.AS": "#2a6fdb", "EQQQ.DE": "#1baa7f", "SMH": "#e08a1e"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("tbot")
+# httpx imprime la URL completa de cada petición, que incluye el token del bot: no lo registramos
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 COMMANDS = [
     ("menu", "Abrir el menú"),
@@ -331,6 +334,9 @@ def make_handlers(action):
     async def run(chat_send, chat_photo):
         try:
             await action(chat_send, chat_photo)
+        except TimedOut:
+            log.warning("Telegram tardó demasiado en responder")
+            await chat_send("⏳ Telegram tardó demasiado en responder. Inténtalo de nuevo en un momento.")
         except Exception:
             log.exception("fallo en acción")
             await chat_send("❌ No pude obtener los datos ahora mismo. Inténtalo de nuevo en un rato.")
@@ -419,7 +425,15 @@ def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en .env")
-    app = Application.builder().token(token).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .connect_timeout(15)
+        .read_timeout(30)
+        .write_timeout(60)  # subir imágenes puede tardar con conexiones lentas
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "menu", "ayuda"], menu))
     for name in ACTIONS:
         app.add_handler(CommandHandler(name, command(name)))
