@@ -16,15 +16,25 @@ import pandas as pd
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TimedOut
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    TypeHandler,
+)
 
 import Bot as engine
 
 BASE = Path(__file__).parent
 PORTFOLIO_FILE = BASE / "portfolio.json"
 SUBS_FILE = BASE / "subscribers.json"
+ALERT_STATE_FILE = BASE / "alert_state.json"
 TZ = ZoneInfo("Europe/Madrid")
 SUMMARY_TIME = time(22, 0, tzinfo=TZ)
+ALERT_TIME = time(22, 5, tzinfo=TZ)  # tras el cierre de EE. UU. (SMH)
+NEAR = 0.02  # aviso previo a 2 puntos de la banda
 NAMES = {"IWDA.AS": "Mundo (IWDA)", "EQQQ.DE": "Nasdaq-100 (EQQQ)", "SMH": "Semis (SMH)"}
 COLORS = {"IWDA.AS": "#2a6fdb", "EQQQ.DE": "#1baa7f", "SMH": "#e08a1e"}
 
@@ -218,14 +228,19 @@ def band_status(values: pd.Series) -> str:
     return flag
 
 
-def portfolio_explain(values: pd.Series) -> str:
+def rebalance_table(values: pd.Series) -> str:
     total = values.sum()
-    lines = [band_status(values), "", "<b>Para volver exactamente al objetivo</b>", "<pre>"]
+    lines = ["<pre>"]
     for t in values.index:
         diff = engine.TARGET[t] * total - values[t]
         lines.append(f"{'Comprar' if diff >= 0 else 'Vender ':<8}{SHORT[t]:<6}{abs(diff):>9,.0f} €")
+    lines.append("</pre>")
+    return "\n".join(lines)
+
+
+def portfolio_explain(values: pd.Series) -> str:
+    lines = [band_status(values), "", "<b>Para volver exactamente al objetivo</b>", rebalance_table(values)]
     lines += [
-        "</pre>",
         "<b>Cómo leerlo</b>",
         "• <b>Dona:</b> qué parte de tu dinero está en cada fondo.",
         "• <b>Barras:</b> color = lo que tienes hoy · gris = lo que te propusiste. "
@@ -381,6 +396,84 @@ async def menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_menu(update.effective_chat, "Hola 👋 Soy el bot de la cartera. ¿Qué quieres ver?")
 
 
+# ───────────── alertas de rebalanceo ─────────────
+def band_state(values: pd.Series) -> str:
+    """ok | near_upper | near_lower | upper | lower, según el peso de los satélites."""
+    w = values[engine.SATELLITES].sum() / values.sum()
+    if w >= engine.UPPER:
+        return "upper"
+    if w <= engine.LOWER:
+        return "lower"
+    if w >= engine.UPPER - NEAR:
+        return "near_upper"
+    if w <= engine.LOWER + NEAR:
+        return "near_lower"
+    return "ok"
+
+
+def alert_text(state: str, values: pd.Series) -> str:
+    w = values[engine.SATELLITES].sum() / values.sum()
+    head = {
+        "upper": "🚨 <b>Toca rebalancear</b>: los satélites pesan demasiado.",
+        "lower": "🚨 <b>Toca rebalancear</b>: los satélites pesan muy poco.",
+        "near_upper": "⚠️ <b>Atención</b>: los satélites se acercan al límite superior.",
+        "near_lower": "⚠️ <b>Atención</b>: los satélites se acercan al límite inferior.",
+        "ok": "✅ Los satélites han vuelto a la zona tranquila de la banda.",
+    }[state]
+    text = f"{head}\n{band_status(values)}"
+    if state in ("upper", "lower"):
+        text += ("\n\n<b>Para volver al objetivo</b>\n" + rebalance_table(values) +
+                 "Rebalancear = vender lo que pesa de más y comprar lo que pesa de menos.")
+    elif state != "ok":
+        text += f"\nBanda de acción: {engine.LOWER:.0%}–{engine.UPPER:.0%} (objetivo 30 %). Aún no hay que hacer nada."
+    return text
+
+
+async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE):
+    """Avisa solo cuando cambia el estado respecto al último chequeo, para no repetir mensajes."""
+    px = await prices_1y()
+    values, total = portfolio_state(px)
+    if total == 0:
+        return
+    state = band_state(values)
+    last = load_json(ALERT_STATE_FILE, {}).get("state", "ok")
+    if state == last:
+        return
+    for chat_id in ctx.bot_data["allowed"]:
+        try:
+            await ctx.bot.send_message(chat_id, alert_text(state, values), parse_mode="HTML")
+        except Exception:
+            log.exception("no pude enviar la alerta a %s", chat_id)
+    ALERT_STATE_FILE.write_text(json.dumps({"state": state}))
+
+
+# ───────────── acceso restringido ─────────────
+def parse_allowed(raw: str | None) -> set[int]:
+    return {int(x) for x in (raw or "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
+
+
+async def my_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    await update.message.reply_text(
+        f"Tu chat ID es {cid}\nPara autorizarlo, ponlo en .env:\nALLOWED_CHAT_IDS={cid}")
+
+
+async def guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Bloquea a cualquier chat que no esté en ALLOWED_CHAT_IDS (salvo /id, para poder configurarlo)."""
+    chat = update.effective_chat
+    if chat is None or chat.id in ctx.bot_data["allowed"]:
+        return
+    msg = update.effective_message
+    if msg and (msg.text or "").split("@")[0].strip() == "/id":
+        return
+    log.warning("acceso denegado al chat %s", chat.id)
+    if msg:
+        await msg.reply_text("🔒 Este bot es privado.")
+    elif update.callback_query:
+        await update.callback_query.answer("Bot privado", show_alert=True)
+    raise ApplicationHandlerStop
+
+
 # ───────────── resumen diario ─────────────
 def set_subscription(chat_id: int, on: bool):
     subs = set(load_json(SUBS_FILE, []))
@@ -425,6 +518,9 @@ def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en .env")
+    allowed = parse_allowed(os.getenv("ALLOWED_CHAT_IDS"))
+    if not allowed:
+        log.warning("ALLOWED_CHAT_IDS vacío: nadie puede usar el bot. Escríbele /id para conocer tu ID.")
     app = (
         Application.builder()
         .token(token)
@@ -434,6 +530,9 @@ def main():
         .write_timeout(60)  # subir imágenes puede tardar con conexiones lentas
         .build()
     )
+    app.bot_data["allowed"] = allowed
+    app.add_handler(TypeHandler(Update, guard), group=-1)
+    app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler(["start", "menu", "ayuda"], menu))
     for name in ACTIONS:
         app.add_handler(CommandHandler(name, command(name)))
@@ -441,6 +540,7 @@ def main():
     app.add_handler(CommandHandler("cancelar", cancelar))
     app.add_handler(CallbackQueryHandler(on_button))
     app.job_queue.run_daily(daily_summary, SUMMARY_TIME, days=(0, 1, 2, 3, 4))
+    app.job_queue.run_daily(check_alerts, ALERT_TIME, days=(0, 1, 2, 3, 4))
     log.info("Bot en marcha")
     app.run_polling()
 

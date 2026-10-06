@@ -3,3 +3,4 @@
 __pycache__/
 subscribers.json
 portfolio.json
+alert_state.json
