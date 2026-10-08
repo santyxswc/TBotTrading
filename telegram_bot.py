@@ -1,3 +1,31 @@
+"""!
+@file telegram_bot.py
+@brief Bot de Telegram privado para seguir la cartera núcleo-satélite.
+
+Expone en Telegram los cálculos del motor (@ref Bot.py):
+
+- `/precio`: tabla de precios en EUR con variación a 1 día, 1 mes y 1 año.
+- `/grafico`: evolución del último año y caídas desde máximos.
+- `/cartera`: reparto actual frente al objetivo y órdenes para rebalancear.
+- `/backtest`: comparativa a 10 años de las estrategias hold, anual y banda.
+- `/suscribir` y `/cancelar`: resumen diario los días laborables a las 22:00.
+- `/id`: muestra el chat ID para poder autorizarlo.
+
+Además, cada día laborable comprueba la banda de los satélites y avisa a los
+chats autorizados cuando cambia su estado (ver @ref telegram_bot.check_alerts).
+
+**Configuración** (archivo `.env` junto al script):
+- `TELEGRAM_BOT_TOKEN`: token del bot dado por @@BotFather.
+- `ALLOWED_CHAT_IDS`: lista de chat IDs autorizados separados por comas.
+
+**Archivos de estado** (en la carpeta del script, ignorados por git):
+- `portfolio.json`: participaciones de cada ETF (plantilla en `portfolio.example.json`).
+- `subscribers.json`: chats suscritos al resumen diario.
+- `alert_state.json`: último estado de banda notificado.
+
+@author santyxswc
+"""
+
 import asyncio
 import io
 import json
@@ -27,22 +55,34 @@ from telegram.ext import (
 
 import Bot as engine
 
+## Carpeta del script; base para `.env` y los archivos de estado.
 BASE = Path(__file__).parent
+## Participaciones por ticker (`{"IWDA.AS": 12.5, ...}`).
 PORTFOLIO_FILE = BASE / "portfolio.json"
+## Lista de chat IDs suscritos al resumen diario.
 SUBS_FILE = BASE / "subscribers.json"
+## Último estado de banda notificado (`{"state": "ok"}`), para no repetir alertas.
 ALERT_STATE_FILE = BASE / "alert_state.json"
+## Zona horaria en la que se programan los trabajos diarios.
 TZ = ZoneInfo("Europe/Madrid")
+## Hora del resumen diario a los suscriptores.
 SUMMARY_TIME = time(22, 0, tzinfo=TZ)
+## Hora de la comprobación de alertas de rebalanceo.
 ALERT_TIME = time(22, 5, tzinfo=TZ)  # tras el cierre de EE. UU. (SMH)
+## Margen (en tanto por uno) antes de la banda a partir del cual se lanza el aviso previo.
 NEAR = 0.02  # aviso previo a 2 puntos de la banda
+## Nombre legible de cada ticker para gráficos y textos.
 NAMES = {"IWDA.AS": "Mundo (IWDA)", "EQQQ.DE": "Nasdaq-100 (EQQQ)", "SMH": "Semis (SMH)"}
+## Color fijo de cada ticker en todos los gráficos.
 COLORS = {"IWDA.AS": "#2a6fdb", "EQQQ.DE": "#1baa7f", "SMH": "#e08a1e"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+## Logger del bot.
 log = logging.getLogger("tbot")
 # httpx imprime la URL completa de cada petición, que incluye el token del bot: no lo registramos
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+## Comandos `(nombre, descripción)` que se registran en el menú de Telegram al arrancar.
 COMMANDS = [
     ("menu", "Abrir el menú"),
     ("precio", "Precios actuales"),
@@ -55,6 +95,15 @@ COMMANDS = [
 
 
 def menu_markup(chat_id: int) -> InlineKeyboardMarkup:
+    """!
+    @brief Teclado en línea del menú principal.
+
+    El último botón alterna entre activar y desactivar el resumen diario
+    según si el chat ya está suscrito.
+
+    @param chat_id Chat para el que se construye el menú.
+    @return Teclado con los botones de precios, gráfico, cartera, backtest y suscripción.
+    """
     subscribed = chat_id in load_json(SUBS_FILE, [])
     toggle = (
         InlineKeyboardButton("🔕 Desactivar resumen diario", callback_data="cancelar")
@@ -73,11 +122,22 @@ def menu_markup(chat_id: int) -> InlineKeyboardMarkup:
 
 
 async def show_menu(chat, text: str = "¿Qué quieres ver?"):
+    """!
+    @brief Envía el menú principal a un chat.
+    @param chat Chat de Telegram (`telegram.Chat`) al que se envía.
+    @param text Texto que acompaña al teclado.
+    """
     await chat.send_message(text, reply_markup=menu_markup(chat.id))
 
 
 # ───────────── datos ─────────────
 def load_json(path: Path, default):
+    """!
+    @brief Lee un archivo JSON tolerando que no exista o esté corrupto.
+    @param path Ruta del archivo.
+    @param default Valor devuelto si el archivo no existe o no es JSON válido.
+    @return Contenido decodificado o @p default.
+    """
     try:
         return json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
@@ -85,6 +145,11 @@ def load_json(path: Path, default):
 
 
 def fig_to_png(fig) -> io.BytesIO:
+    """!
+    @brief Renderiza una figura de matplotlib a PNG en memoria y la cierra.
+    @param fig Figura de matplotlib.
+    @return Buffer con la imagen, posicionado al inicio y listo para enviar.
+    """
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -92,7 +157,9 @@ def fig_to_png(fig) -> io.BytesIO:
     return buf
 
 
+## Ticker sin sufijo de bolsa (`"IWDA.AS"` → `"IWDA"`), para tablas estrechas.
 SHORT = {t: t.split(".")[0] for t in engine.TARGET}
+## Descripción en lenguaje claro de cada ETF.
 DESC = {
     "IWDA.AS": "miles de empresas grandes de países desarrollados (tu base, 70 %)",
     "EQQQ.DE": "las 100 mayores tecnológicas/no financieras del Nasdaq (15 %)",
@@ -101,10 +168,25 @@ DESC = {
 
 
 def fmt_pct(x: float, dec: int = 1) -> str:
+    """!
+    @brief Formatea un tanto por uno como porcentaje con signo (`0.052` → `"+5.2%"`).
+    @param x Valor en tanto por uno.
+    @param dec Número de decimales.
+    @return Cadena formateada.
+    """
     return f"{x:+.{dec}%}"
 
 
 def price_table(px: pd.DataFrame) -> str:
+    """!
+    @brief Tabla HTML con el último precio y la variación a 1 día, 1 mes y 1 año.
+
+    La variación diaria se calcula contra el último precio distinto, porque
+    @ref Bot.download rellena con el valor anterior los días sin mercado.
+
+    @param px Precios del último año (salida de @ref prices_1y).
+    @return Texto en HTML de Telegram (`<pre>` monoespaciado).
+    """
     last = px.iloc[-1]
     # download() rellena con ffill los días sin cotización: comparamos con el último precio distinto
     prev = pd.Series({t: px[t][px[t] != last[t]].iloc[-1] for t in px})
@@ -122,6 +204,10 @@ def price_table(px: pd.DataFrame) -> str:
 
 
 def price_explain() -> str:
+    """!
+    @brief Explicación en lenguaje claro de los ETF y de cómo leer @ref price_table.
+    @return Texto en HTML de Telegram.
+    """
     lines = ["<b>¿Qué significa cada cosa?</b>"]
     lines += [f"• <b>{SHORT[t]}</b>: {DESC[t]}." for t in engine.TARGET]
     lines += [
@@ -140,6 +226,16 @@ def price_explain() -> str:
 
 
 def chart_prices(px: pd.DataFrame) -> io.BytesIO:
+    """!
+    @brief Gráfico del último año: evolución en base 100 y caída desde máximos.
+
+    - Panel superior: precio normalizado a 100 al inicio, con el máximo
+      marcado y la variación final anotada.
+    - Panel inferior: drawdown (%) de cada ETF respecto a su máximo.
+
+    @param px Precios del último año.
+    @return Imagen PNG en memoria.
+    """
     norm = px / px.iloc[0] * 100
     under = (px / px.cummax() - 1) * 100
     fig, (ax, ax2) = plt.subplots(2, 1, figsize=(8, 6.4), sharex=True,
@@ -165,6 +261,11 @@ def chart_prices(px: pd.DataFrame) -> io.BytesIO:
 
 
 def chart_prices_explain(px: pd.DataFrame) -> str:
+    """!
+    @brief Resumen del último año (mejor y peor ETF) y guía para leer @ref chart_prices.
+    @param px Precios del último año.
+    @return Texto en HTML de Telegram.
+    """
     norm = px / px.iloc[0] * 100
     under = px.iloc[-1] / px.max() - 1
     lines = ["<b>Resumen del último año</b>"]
@@ -186,12 +287,25 @@ def chart_prices_explain(px: pd.DataFrame) -> str:
 
 
 def portfolio_state(px: pd.DataFrame):
+    """!
+    @brief Valor actual de cada posición según `portfolio.json`.
+
+    Los tickers que no aparecen en el archivo cuentan como 0 participaciones.
+
+    @param px Precios en EUR; se usa la última fila.
+    @return Tupla `(values, total)`: serie con el valor en EUR por ticker y su suma.
+    """
     holdings = load_json(PORTFOLIO_FILE, {})
     values = pd.Series({t: holdings.get(t, 0) * px[t].iloc[-1] for t in engine.TARGET})
     return values, values.sum()
 
 
 def chart_portfolio(values: pd.Series) -> io.BytesIO:
+    """!
+    @brief Gráfico de la cartera: dona con el reparto y barras actual vs. objetivo.
+    @param values Valor en EUR por ticker (de @ref portfolio_state).
+    @return Imagen PNG en memoria.
+    """
     total = values.sum()
     w = values / total
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.5, 4.4))
@@ -218,6 +332,12 @@ def chart_portfolio(values: pd.Series) -> io.BytesIO:
 
 
 def band_status(values: pd.Series) -> str:
+    """!
+    @brief Línea de estado del peso de los satélites frente a la banda.
+    @param values Valor en EUR por ticker.
+    @return Texto HTML: aviso de rebalanceo si está fuera de
+            [@ref Bot.LOWER, @ref Bot.UPPER] o confirmación si está dentro.
+    """
     w_sat = values[engine.SATELLITES].sum() / values.sum()
     if w_sat >= engine.UPPER:
         flag = f"⚠️ Satélites en {w_sat:.1%} (≥ {engine.UPPER:.0%}): <b>toca rebalancear</b>"
@@ -229,6 +349,11 @@ def band_status(values: pd.Series) -> str:
 
 
 def rebalance_table(values: pd.Series) -> str:
+    """!
+    @brief Importe a comprar o vender de cada ETF para volver a @ref Bot.TARGET.
+    @param values Valor en EUR por ticker.
+    @return Tabla HTML (`<pre>`). No incluye comisiones ni impuestos.
+    """
     total = values.sum()
     lines = ["<pre>"]
     for t in values.index:
@@ -239,6 +364,12 @@ def rebalance_table(values: pd.Series) -> str:
 
 
 def portfolio_explain(values: pd.Series) -> str:
+    """!
+    @brief Texto que acompaña a @ref chart_portfolio con el estado de la banda,
+           órdenes de rebalanceo y guía de lectura.
+    @param values Valor en EUR por ticker.
+    @return Texto en HTML de Telegram.
+    """
     lines = [band_status(values), "", "<b>Para volver exactamente al objetivo</b>", rebalance_table(values)]
     lines += [
         "<b>Cómo leerlo</b>",
@@ -254,6 +385,16 @@ def portfolio_explain(values: pd.Series) -> str:
 
 
 def chart_backtest(rets: pd.DataFrame) -> tuple[io.BytesIO, str]:
+    """!
+    @brief Gráfico y tabla del backtest de las tres estrategias de @ref Bot.backtest.
+
+    - Panel superior: evolución de 1 € invertido con cada estrategia; las
+      etiquetas finales se separan para que no se solapen.
+    - Panel inferior: drawdown (%) de cada estrategia.
+
+    @param rets Rentabilidades diarias del periodo completo.
+    @return Tupla `(imagen PNG, texto HTML)` con la tabla de métricas y la explicación.
+    """
     fig, (ax, ax2) = plt.subplots(2, 1, figsize=(8, 6.4), sharex=True,
                                   gridspec_kw={"height_ratios": [3, 1.4], "hspace": 0.08})
     rows, ends = {}, []
@@ -308,22 +449,45 @@ def chart_backtest(rets: pd.DataFrame) -> tuple[io.BytesIO, str]:
 
 
 # ───────────── acciones (sirven para comandos y botones) ─────────────
+# Cada acción recibe dos corrutinas: send(texto_html) y photo(imagen, pie).
 async def prices_1y() -> pd.DataFrame:
+    """!
+    @brief Descarga un año de precios sin bloquear el bucle de eventos.
+    @return Precios en EUR del último año (ver @ref Bot.download).
+    """
     return await asyncio.to_thread(engine.download, 1)
 
 
 async def act_precio(send, photo):
+    """!
+    @brief Acción `precio`: tabla de precios y su explicación.
+    @param send Corrutina que envía un texto HTML al chat.
+    @param photo Corrutina que envía una imagen con pie de foto (no se usa).
+    """
     await send(price_table(await prices_1y()))
     await send(price_explain())
 
 
 async def act_grafico(send, photo):
+    """!
+    @brief Acción `grafico`: gráfico del último año y su resumen.
+    @param send Corrutina que envía un texto HTML al chat.
+    @param photo Corrutina que envía una imagen con pie de foto.
+    """
     px = await prices_1y()
     await photo(chart_prices(px), "Último año: evolución y caídas desde máximos")
     await send(chart_prices_explain(px))
 
 
 async def act_cartera(send, photo):
+    """!
+    @brief Acción `cartera`: gráfico de la cartera, estado de la banda y rebalanceo.
+
+    Si `portfolio.json` no existe o está vacío, indica cómo crearlo.
+
+    @param send Corrutina que envía un texto HTML al chat.
+    @param photo Corrutina que envía una imagen con pie de foto.
+    """
     px = await prices_1y()
     values, total = portfolio_state(px)
     if total == 0:
@@ -335,6 +499,11 @@ async def act_cartera(send, photo):
 
 
 async def act_backtest(send, photo):
+    """!
+    @brief Acción `backtest`: descarga 10 años y muestra @ref chart_backtest.
+    @param send Corrutina que envía un texto HTML al chat.
+    @param photo Corrutina que envía una imagen con pie de foto.
+    """
     await send("Calculando backtest, tarda unos segundos…")
     px = await asyncio.to_thread(engine.download)
     img, text = chart_backtest(px.pct_change().dropna())
@@ -342,10 +511,21 @@ async def act_backtest(send, photo):
     await send(text)
 
 
+## Acciones disponibles por nombre; el mismo nombre sirve de comando y de `callback_data`.
 ACTIONS = {"precio": act_precio, "grafico": act_grafico, "cartera": act_cartera, "backtest": act_backtest}
 
 
 def make_handlers(action):
+    """!
+    @brief Envuelve una acción para que los errores lleguen al usuario como mensaje.
+
+    Un `TimedOut` de Telegram y cualquier otra excepción (p. ej. fallo al
+    descargar datos) se registran en el log y se responde con un aviso, en
+    lugar de dejar el chat sin respuesta.
+
+    @param action Una de las corrutinas de @ref ACTIONS.
+    @return Corrutina `run(chat_send, chat_photo)` que ejecuta la acción protegida.
+    """
     async def run(chat_send, chat_photo):
         try:
             await action(chat_send, chat_photo)
@@ -359,6 +539,11 @@ def make_handlers(action):
 
 
 async def dispatch(name: str, update: Update):
+    """!
+    @brief Ejecuta una acción en el chat del update y vuelve a mostrar el menú.
+    @param name Clave de @ref ACTIONS.
+    @param update Update de Telegram (comando o pulsación de botón).
+    """
     chat = update.effective_chat
 
     async def send(text):
@@ -372,12 +557,26 @@ async def dispatch(name: str, update: Update):
 
 
 def command(name):
+    """!
+    @brief Crea el handler de un comando `/name` que lanza la acción homónima.
+    @param name Clave de @ref ACTIONS.
+    @return Callback compatible con `CommandHandler`.
+    """
     async def handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await dispatch(name, update)
     return handler
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """!
+    @brief Handler de los botones del menú en línea.
+
+    `suscribir`/`cancelar` cambian la suscripción y actualizan el teclado en
+    el mismo mensaje; el resto de valores conocidos ejecutan su acción.
+
+    @param update Update con la `callback_query`.
+    @param ctx Contexto de python-telegram-bot.
+    """
     q = update.callback_query
     chat = update.effective_chat
     if q.data in ("suscribir", "cancelar"):
@@ -393,12 +592,27 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """!
+    @brief Handler de `/start`, `/menu` y `/ayuda`: saluda y muestra el menú.
+    @param update Update de Telegram.
+    @param ctx Contexto de python-telegram-bot.
+    """
     await show_menu(update.effective_chat, "Hola 👋 Soy el bot de la cartera. ¿Qué quieres ver?")
 
 
 # ───────────── alertas de rebalanceo ─────────────
 def band_state(values: pd.Series) -> str:
-    """ok | near_upper | near_lower | upper | lower, según el peso de los satélites."""
+    """!
+    @brief Clasifica el peso de los satélites respecto a la banda.
+
+    @param values Valor en EUR por ticker.
+    @return Uno de:
+            - `"upper"`: ≥ @ref Bot.UPPER (hay que rebalancear).
+            - `"lower"`: ≤ @ref Bot.LOWER (hay que rebalancear).
+            - `"near_upper"`: a menos de @ref NEAR del límite superior.
+            - `"near_lower"`: a menos de @ref NEAR del límite inferior.
+            - `"ok"`: zona tranquila.
+    """
     w = values[engine.SATELLITES].sum() / values.sum()
     if w >= engine.UPPER:
         return "upper"
@@ -412,6 +626,16 @@ def band_state(values: pd.Series) -> str:
 
 
 def alert_text(state: str, values: pd.Series) -> str:
+    """!
+    @brief Mensaje de alerta para un estado de @ref band_state.
+
+    Fuera de la banda incluye la @ref rebalance_table; cerca de ella solo
+    recuerda los límites.
+
+    @param state Estado devuelto por @ref band_state.
+    @param values Valor en EUR por ticker.
+    @return Texto en HTML de Telegram.
+    """
     w = values[engine.SATELLITES].sum() / values.sum()
     head = {
         "upper": "🚨 <b>Toca rebalancear</b>: los satélites pesan demasiado.",
@@ -430,7 +654,16 @@ def alert_text(state: str, values: pd.Series) -> str:
 
 
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE):
-    """Avisa solo cuando cambia el estado respecto al último chequeo, para no repetir mensajes."""
+    """!
+    @brief Trabajo diario: avisa solo cuando cambia el estado respecto al último chequeo,
+           para no repetir mensajes.
+
+    Compara @ref band_state con el guardado en `alert_state.json`; si es
+    distinto, envía @ref alert_text a todos los chats autorizados y guarda
+    el nuevo estado. No hace nada si la cartera está vacía.
+
+    @param ctx Contexto del job; `ctx.bot_data["allowed"]` contiene los chats autorizados.
+    """
     px = await prices_1y()
     values, total = portfolio_state(px)
     if total == 0:
@@ -449,17 +682,43 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ───────────── acceso restringido ─────────────
 def parse_allowed(raw: str | None) -> set[int]:
+    """!
+    @brief Convierte `ALLOWED_CHAT_IDS` en un conjunto de enteros.
+
+    Ignora espacios y entradas no numéricas; admite IDs negativos (grupos).
+
+    @param raw Valor de la variable de entorno, p. ej. `"123, -456"`, o `None`.
+    @return Conjunto de chat IDs (vacío si no hay ninguno válido).
+    """
     return {int(x) for x in (raw or "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
 
 
 async def my_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """!
+    @brief Handler de `/id`: responde con el chat ID y cómo autorizarlo.
+
+    Es el único comando que @ref guard deja pasar a chats no autorizados.
+
+    @param update Update de Telegram.
+    @param ctx Contexto de python-telegram-bot.
+    """
     cid = update.effective_chat.id
     await update.message.reply_text(
         f"Tu chat ID es {cid}\nPara autorizarlo, ponlo en .env:\nALLOWED_CHAT_IDS={cid}")
 
 
 async def guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Bloquea a cualquier chat que no esté en ALLOWED_CHAT_IDS (salvo /id, para poder configurarlo)."""
+    """!
+    @brief Bloquea a cualquier chat que no esté en ALLOWED_CHAT_IDS (salvo /id, para poder configurarlo).
+
+    Se registra en el grupo -1 para ejecutarse antes que el resto de
+    handlers. A los chats no autorizados les responde que el bot es privado
+    y corta el procesamiento.
+
+    @param update Update entrante de cualquier tipo.
+    @param ctx Contexto; `ctx.bot_data["allowed"]` contiene los chats autorizados.
+    @exception ApplicationHandlerStop Si el chat no está autorizado.
+    """
     chat = update.effective_chat
     if chat is None or chat.id in ctx.bot_data["allowed"]:
         return
@@ -476,24 +735,47 @@ async def guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ───────────── resumen diario ─────────────
 def set_subscription(chat_id: int, on: bool):
+    """!
+    @brief Añade o quita un chat de `subscribers.json`.
+    @param chat_id Chat a modificar.
+    @param on `True` para suscribir, `False` para cancelar.
+    """
     subs = set(load_json(SUBS_FILE, []))
     subs.add(chat_id) if on else subs.discard(chat_id)
     SUBS_FILE.write_text(json.dumps(sorted(subs)))
 
 
 async def suscribir(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """!
+    @brief Handler de `/suscribir`: activa el resumen diario para el chat.
+    @param update Update de Telegram.
+    @param ctx Contexto de python-telegram-bot.
+    """
     set_subscription(update.effective_chat.id, True)
     await update.message.reply_text("✅ Te enviaré el resumen cada día laborable a las 22:00.")
     await show_menu(update.effective_chat)
 
 
 async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """!
+    @brief Handler de `/cancelar`: desactiva el resumen diario para el chat.
+    @param update Update de Telegram.
+    @param ctx Contexto de python-telegram-bot.
+    """
     set_subscription(update.effective_chat.id, False)
     await update.message.reply_text("Listo, resumen diario desactivado.")
     await show_menu(update.effective_chat)
 
 
 async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE):
+    """!
+    @brief Trabajo diario: envía la tabla de precios y el estado de la cartera a los suscriptores.
+
+    Si un envío falla (p. ej. el usuario bloqueó el bot), se registra y se
+    continúa con el siguiente.
+
+    @param ctx Contexto del job de python-telegram-bot.
+    """
     subs = load_json(SUBS_FILE, [])
     if not subs:
         return
@@ -510,10 +792,24 @@ async def daily_summary(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
+    """!
+    @brief Registra @ref COMMANDS en Telegram una vez inicializada la aplicación.
+    @param app Aplicación de python-telegram-bot.
+    """
     await app.bot.set_my_commands(COMMANDS)
 
 
 def main():
+    """!
+    @brief Punto de entrada: configura y arranca el bot en modo polling.
+
+    Lee `.env`, construye la aplicación con timeouts amplios (subir imágenes
+    puede tardar), registra @ref guard antes de todos los handlers, los
+    comandos y botones, y programa @ref daily_summary y @ref check_alerts
+    de lunes a viernes.
+
+    @exception SystemExit Si falta `TELEGRAM_BOT_TOKEN`.
+    """
     load_dotenv(BASE / ".env")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
