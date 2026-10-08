@@ -1,0 +1,31 @@
+# Configuración de Doxygen para TBotTrading.
+# Solo se listan las opciones distintas del valor por defecto.
+# Uso: doxygen   → genera docs/html/index.html
+
+PROJECT_NAME           = "TBotTrading"
+PROJECT_BRIEF          = "Bot de Telegram y backtest de una cartera núcleo-satélite de ETF"
+OUTPUT_DIRECTORY       = docs
+OUTPUT_LANGUAGE        = Spanish
+
+INPUT                  = README.md Bot.py telegram_bot.py
+USE_MDFILE_AS_MAINPAGE = README.md
+FILE_PATTERNS          = *.py *.md
+
+# Python: interpretar los docstrings que empiezan por """! como comentarios Doxygen
+PYTHON_DOCSTRING       = YES
+OPTIMIZE_OUTPUT_JAVA   = YES
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+JAVADOC_AUTOBRIEF      = YES
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HAVE_DOT               = NO
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = YES
